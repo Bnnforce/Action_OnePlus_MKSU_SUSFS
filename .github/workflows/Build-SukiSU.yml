@@ -326,74 +326,69 @@ jobs:
          cd kernel_workspace
          LTO=thin SYSTEM_DLKM_RE_SIGN=0 BUILD_SYSTEM_DLKM=0 KMI_SYMBOL_LIST_STRICT_MODE=0 ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ github.event.inputs.CPUD }} ${{ github.event.inputs.BUILD_METHOD }}
 
+      # 可选的调试步骤，显示 out 目录结构，便于排查构建产物位置
+      - name: Debug out directory tree
+        if: always()
+        run: |
+          echo "=== out 目录结构 ==="
+          find kernel_workspace/kernel_platform/out -type f -name "Image" -o -type d 2>/dev/null | head -n 50
+
       - name: Make AnyKernel3
+        id: make_ak3
         run: |
           git clone https://github.com/Numbersf/AnyKernel3 --depth=1
           rm -rf ./AnyKernel3/.git
 
-          dir1="kernel_workspace/kernel_platform/out/msm-kernel-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/dist/"
-          dir2="kernel_workspace/kernel_platform/bazel-out/k8-fastbuild/bin/msm-kernel/${{ github.event.inputs.CPUD }}_gki_kbuild_mixed_tree/"
-          dir3="kernel_workspace/kernel_platform/out/msm-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/dist/"
-          dir4="kernel_workspace/kernel_platform/out/msm-kernel-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/gki_kernel/common/arch/arm64/boot/"
-          dir5="kernel_workspace/kernel_platform/out/msm-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/gki_kernel/common/arch/arm64/boot/"
-          target1="./AnyKernel3/"
-          target2="./kernel_workspace/kernel"
+          # 递归查找 Image 文件
+          image_path=$(find kernel_workspace/kernel_platform/out -type f -name Image | head -n 1)
 
-          # 查找 Image 文件
-          if find "$dir1" -name "Image" | grep -q "Image"; then
-            image_path="$dir1"Image
-          elif find "$dir2" -name "Image" | grep -q "Image"; then
-            image_path="$dir2"Image
-          elif find "$dir3" -name "Image" | grep -q "Image"; then
-            image_path="$dir3"Image
-          elif find "$dir4" -name "Image" | grep -q "Image"; then
-            image_path="$dir4"Image
-          elif find "$dir5" -name "Image" | grep -q "Image"; then
-            image_path="$dir5"Image
-          else
-            image_path=$(find "./kernel_workspace/kernel_platform/common/out/" -name "Image" | head -n 1)
-          fi
-
-          # 拷贝 Image
-          if [ -n "$image_path" ] && [ -f "$image_path" ]; then
-            mkdir -p "$dir1"
-            if [ "$(realpath "$image_path")" != "$(realpath "$dir1"Image)" ]; then
-              cp "$image_path" "$dir1"
-            else
-              echo "源文件与目标相同，跳过复制"
-            fi
-            cp "$dir1"Image ./AnyKernel3/Image
-          else
-            echo "未找到 Image 文件，构建可能失败"
+          if [ -z "$image_path" ]; then
+            echo "ERROR: 未找到 Image 文件，构建可能未成功生成内核。"
+            echo "当前 out 目录结构："
+            find kernel_workspace/kernel_platform/out -type d 2>/dev/null || true
             exit 1
           fi
 
-          # 可选复制其它新文件（如果存在）
+          echo "Found Image: $image_path"
+          cp "$image_path" ./AnyKernel3/Image
+
+          # 保存 Image 所在目录，供后续 patch_linux 使用
+          image_dir=$(dirname "$image_path")
+          echo "IMAGE_DIR=$image_dir" >> $GITHUB_ENV
+
+          # sm8750/sm8850 特殊文件复制
           if [ "${{ github.event.inputs.CPU }}" = "sm8750" ] || [ "${{ github.event.inputs.CPU }}" = "sm8850" ]; then
-          for file in dtbo.img system_dlkm.erofs.img vendor_dlkm.img vendor_boot.img; do
-            if [ -f "$dir1$file" ]; then
+            dist_dir="$image_dir/.."
+            for file in dtbo.img system_dlkm.erofs.img vendor_dlkm.img vendor_boot.img; do
               target_name="$file"
-              # 特殊处理 system_dlkm.erofs.img 的目标名
               if [ "$file" = "system_dlkm.erofs.img" ]; then
                 target_name="system_dlkm.img"
               fi
-              cp "$dir1$file" "./AnyKernel3/$target_name"
-            else
-              echo "$file 不存在，跳过复制"
-            fi
-          done
+              if [ -f "$dist_dir/$file" ]; then
+                cp "$dist_dir/$file" "./AnyKernel3/$target_name"
+              else
+                echo "$file 不存在，跳过复制"
+              fi
+            done
           fi
 
       - name: Apply patch_linux and replace Image
         if: ${{ github.event.inputs.KPM == 'true' }}
         run: |
-          cd /home/runner/work/Action_OnePlus_MKSU_SUSFS/Action_OnePlus_MKSU_SUSFS/kernel_workspace/kernel_platform/out/msm-kernel-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/dist
+          if [ -z "$IMAGE_DIR" ] || [ ! -d "$IMAGE_DIR" ]; then
+            echo "ERROR: IMAGE_DIR 未正确设置或目录不存在"
+            exit 1
+          fi
+
+          cd "$IMAGE_DIR"
 
           curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU_patch/refs/heads/main/kpm/patch_linux" -o patch_linux
           chmod +x patch_linux
           ./patch_linux
           rm -f Image
           mv oImage Image
+
+          # 覆盖 AnyKernel3 中的旧 Image
           cp Image $GITHUB_WORKSPACE/AnyKernel3/Image
 
       # 下载 SUSFS 模块（CI）
@@ -431,8 +426,8 @@ jobs:
         id: feil_clean
         run: |
           clean_feil="${{ github.event.inputs.FEIL }}"
-          clean_feil="${clean_feil%_v}"  # 去掉结尾的 _v（如果有）
-          clean_feil="${clean_feil%_u}"  # 去掉结尾的 _u（如果有）
+          clean_feil="${clean_feil%_v}"
+          clean_feil="${clean_feil%_u}"
           echo "value=$clean_feil" >> $GITHUB_OUTPUT
 
       - name: Upload AnyKernel3
